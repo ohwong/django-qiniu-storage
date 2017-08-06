@@ -5,13 +5,12 @@ from __future__ import absolute_import, unicode_literals
 import datetime
 import os
 import posixpath
-import warnings
 
 import six
 from six.moves import cStringIO as StringIO
 from six.moves.urllib_parse import urljoin, urlparse
 
-from qiniu import Auth, BucketManager, put_data
+from qiniu import Auth, BucketManager, put_data, put_stream
 import requests
 
 from django.conf import settings
@@ -19,7 +18,6 @@ from django.core.files.base import File
 from django.core.files.storage import Storage
 from django.core.exceptions import ImproperlyConfigured, SuspiciousOperation
 from django.utils.encoding import force_text, force_bytes, filepath_to_uri
-from django.utils.deconstruct import deconstructible
 
 from .utils import QiniuError, bucket_lister
 
@@ -54,7 +52,7 @@ if isinstance(QINIU_SECURE_URL, six.string_types):
     else:
         QINIU_SECURE_URL = False
 
-@deconstructible
+
 class QiniuStorage(Storage):
     """
     Qiniu Storage Service
@@ -115,14 +113,27 @@ class QiniuStorage(Storage):
     def _save(self, name, content):
         cleaned_name = self._clean_name(name)
         name = self._normalize_name(cleaned_name)
+        if content._get_size() > 4194304:
+            self._put_file_stream(name, cleaned_name, content, content._get_size())
+            return cleaned_name
+        if hasattr(content, 'open'):
+            # Since Django 1.6, content should be a instance
+            # of `django.core.files.File`
+            content.open()
 
         if hasattr(content, 'chunks'):
             content_str = b''.join(chunk for chunk in content.chunks())
         else:
             content_str = content.read()
-
         self._put_file(name, content_str)
+        content.close()
         return cleaned_name
+
+    def _put_file_stream(self, name, cleaned_name, content, content_length):
+        token = self.auth.upload_token(self.bucket_name)
+        ret, info = put_stream(token, name, content, cleaned_name,  content_length)
+        if ret is None or ret['key'] != name:
+            raise QiniuError(info)
 
     def _put_file(self, name, content):
         token = self.auth.upload_token(self.bucket_name)
@@ -188,29 +199,16 @@ class QiniuStorage(Storage):
     def url(self, name):
         name = self._normalize_name(self._clean_name(name))
         name = filepath_to_uri(name)
-        protocol = u'https://' if self.secure_url else u'http://'
+        protocol = 'https://' if self.secure_url else 'http://'
         return urljoin(protocol + self.bucket_domain, name)
 
 
 class QiniuMediaStorage(QiniuStorage):
-    def __init__(self, *args, **kwargs):
-        warnings.warn(
-            "QiniuMediaStorage is deprecated, and will be removed in the future."
-            "User uploads handled by QiniuMediaStorage are public and can be accessed without any checks."
-            "For general use, please choose QiniuPrivateStorage instead."
-            , DeprecationWarning)
-        super(QiniuMediaStorage, self).__init__(*args, **kwargs)
-    location = settings.MEDIA_ROOT
+    location = 'media'
 
 
 class QiniuStaticStorage(QiniuStorage):
-    location = settings.STATIC_ROOT or "static"
-
-
-class QiniuPrivateStorage(QiniuStorage):
-    def url(self, name):
-        raw_url = super(QiniuPrivateStorage, self).url(name)
-        return force_text(self.auth.private_download_url(raw_url))
+    location = 'static'
 
 
 class QiniuFile(File):
@@ -221,8 +219,8 @@ class QiniuFile(File):
         self.file = six.BytesIO()
         self._is_dirty = False
         self._is_read = False
-        self.name = slef._name
-        
+        self.name = self._name
+
     @property
     def size(self):
         if self._is_dirty or self._is_read:
